@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from IPython import embed
 
 from attention import MultiHeadAttention
 from module import PositionalEncoding, PositionwiseFeedForward
@@ -17,6 +18,7 @@ class Decoder(nn.Module):
             n_layers, n_head, d_k, d_v,
             d_model, d_inner, dropout=0.1,
             tgt_emb_prj_weight_sharing=True,
+            audio_weight=0.5,
             pe_maxlen=5000):
         super(Decoder, self).__init__()
         # parameters
@@ -33,12 +35,17 @@ class Decoder(nn.Module):
         self.dropout = dropout
         self.tgt_emb_prj_weight_sharing = tgt_emb_prj_weight_sharing
         self.pe_maxlen = pe_maxlen
-
+        self.audio_weight = audio_weight
+        print("*"*50, self.audio_weight)
         self.tgt_word_emb = nn.Embedding(n_tgt_vocab, d_word_vec)
         self.positional_encoding = PositionalEncoding(d_model, max_len=pe_maxlen)
         self.dropout = nn.Dropout(dropout)
 
-        self.layer_stack = nn.ModuleList([
+        self.aud_layer_stack = nn.ModuleList([
+            DecoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
+            for _ in range(n_layers)])
+
+        self.vis_layer_stack = nn.ModuleList([
             DecoderLayer(d_model, d_inner, n_head, d_k, d_v, dropout=dropout)
             for _ in range(n_layers)])
 
@@ -69,8 +76,8 @@ class Decoder(nn.Module):
         assert ys_in_pad.size() == ys_out_pad.size()
         return ys_in_pad, ys_out_pad
 
-    def forward(self, padded_input, encoder_padded_outputs,
-                encoder_input_lengths, return_attns=False):
+    def forward(self, padded_input, audio_encoder_padded_outputs, visual_encoder_padded_outputs, 
+                audio_input_lengths, visual_input_lengths, return_attns=False):
         """
         Args:
             padded_input: N x To
@@ -85,35 +92,46 @@ class Decoder(nn.Module):
 
         # Prepare masks
         non_pad_mask = get_non_pad_mask(ys_in_pad, pad_idx=self.eos_id)
-
         slf_attn_mask_subseq = get_subsequent_mask(ys_in_pad)
         slf_attn_mask_keypad = get_attn_key_pad_mask(seq_k=ys_in_pad,
                                                      seq_q=ys_in_pad,
                                                      pad_idx=self.eos_id)
-        slf_attn_mask = (slf_attn_mask_keypad + slf_attn_mask_subseq).gt(0)
+        slf_attn_mask = (slf_attn_mask_keypad.type(torch.uint8) + slf_attn_mask_subseq).gt(0)
 
         output_length = ys_in_pad.size(1)
-        dec_enc_attn_mask = get_attn_pad_mask(encoder_padded_outputs,
-                                              encoder_input_lengths,
+        aud_dec_enc_attn_mask = get_attn_pad_mask(audio_encoder_padded_outputs,
+                                              audio_input_lengths,
                                               output_length)
-
+        vis_dec_enc_attn_mask = get_attn_pad_mask(visual_encoder_padded_outputs,
+                                              visual_input_lengths,
+                                              output_length)
         # Forward
-        dec_output = self.dropout(self.tgt_word_emb(ys_in_pad) * self.x_logit_scale +
+        aud_dec_output = self.dropout(self.tgt_word_emb(ys_in_pad) * self.x_logit_scale +
+                                  self.positional_encoding(ys_in_pad))
+        vis_dec_output = self.dropout(self.tgt_word_emb(ys_in_pad) * self.x_logit_scale +
                                   self.positional_encoding(ys_in_pad))
 
-        for dec_layer in self.layer_stack:
-            dec_output, dec_slf_attn, dec_enc_attn = dec_layer(
-                dec_output, encoder_padded_outputs,
+        for dec_layer in self.aud_layer_stack:
+            aud_dec_output, dec_slf_attn, dec_enc_attn = dec_layer(
+                aud_dec_output, audio_encoder_padded_outputs,
                 non_pad_mask=non_pad_mask,
                 slf_attn_mask=slf_attn_mask,
-                dec_enc_attn_mask=dec_enc_attn_mask)
+                dec_enc_attn_mask=aud_dec_enc_attn_mask)
+        for dec_layer in self.vis_layer_stack:
+            vis_dec_output, dec_slf_attn, dec_enc_attn = dec_layer(
+                vis_dec_output, visual_encoder_padded_outputs,
+                non_pad_mask=non_pad_mask,
+                slf_attn_mask=slf_attn_mask,
+                dec_enc_attn_mask=vis_dec_enc_attn_mask)
 
             if return_attns:
                 dec_slf_attn_list += [dec_slf_attn]
                 dec_enc_attn_list += [dec_enc_attn]
 
         # before softmax
-        seq_logit = self.tgt_word_prj(dec_output)
+        # seq_logit = self.tgt_word_prj(0.9 * aud_dec_output + 0.1 * vis_dec_output)
+        seq_logit = self.tgt_word_prj(self.audio_weight * aud_dec_output + (1 - self.audio_weight) * vis_dec_output)
+        
 
         # Return
         pred, gold = seq_logit, ys_out_pad
@@ -123,10 +141,11 @@ class Decoder(nn.Module):
         return pred, gold
 
 
-    def recognize_beam(self, encoder_outputs, char_list, args):
+    def recognize_beam(self, audio_encoder_outputs, visual_encoder_outputs, char_list, args):
         """Beam search, decode one utterence now.
         Args:
-            encoder_outputs: T x H
+            audio_encoder_outputs: T x H
+            visual_encoder_outputs: T x H
             char_list: list of character
             args: args.beam
 
@@ -137,14 +156,15 @@ class Decoder(nn.Module):
         beam = args.beam_size
         nbest = args.nbest
         if args.decode_max_len == 0:
-            maxlen = encoder_outputs.size(0)
+            maxlen = max(audio_encoder_outputs.size(0), visual_encoder_outputs.size(0))
         else:
             maxlen = args.decode_max_len
 
-        encoder_outputs = encoder_outputs.unsqueeze(0)
+        audio_encoder_outputs = audio_encoder_outputs.unsqueeze(0)
+        visual_encoder_outputs = visual_encoder_outputs.unsqueeze(0)
 
         # prepare sos
-        ys = torch.ones(1, 1).fill_(self.sos_id).type_as(encoder_outputs).long()
+        ys = torch.ones(1, 1).fill_(self.sos_id).type_as(audio_encoder_outputs).long()
 
         # yseq: 1xT
         hyp = {'score': 0.0, 'yseq': ys}
@@ -161,18 +181,30 @@ class Decoder(nn.Module):
                 slf_attn_mask = get_subsequent_mask(ys)
 
                 # -- Forward
-                dec_output = self.dropout(
+                aud_dec_output = self.dropout(
+                    self.tgt_word_emb(ys) * self.x_logit_scale +
+                    self.positional_encoding(ys))
+                vis_dec_output = self.dropout(
                     self.tgt_word_emb(ys) * self.x_logit_scale +
                     self.positional_encoding(ys))
 
-                for dec_layer in self.layer_stack:
-                    dec_output, _, _ = dec_layer(
-                        dec_output, encoder_outputs,
+                for dec_layer in self.aud_layer_stack:
+                    aud_dec_output, _, _ = dec_layer(
+                        aud_dec_output, audio_encoder_outputs,
                         non_pad_mask=non_pad_mask,
                         slf_attn_mask=slf_attn_mask,
                         dec_enc_attn_mask=None)
 
-                seq_logit = self.tgt_word_prj(dec_output[:, -1])
+                for dec_layer in self.vis_layer_stack:
+                    vis_dec_output, _, _ = dec_layer(
+                        vis_dec_output, visual_encoder_outputs,
+                        non_pad_mask=non_pad_mask,
+                        slf_attn_mask=slf_attn_mask,
+                        dec_enc_attn_mask=None)
+
+                # seq_logit = self.tgt_word_prj(aud_dec_output[:, -1] * 0.9 + vis_dec_output[:, -1] * 0.1)
+                seq_logit = self.tgt_word_prj(aud_dec_output[:, -1] * 1.0 + vis_dec_output[:, -1] * 0.0)
+                
 
                 local_scores = F.log_softmax(seq_logit, dim=1)
                 # topk scores
@@ -182,7 +214,7 @@ class Decoder(nn.Module):
                 for j in range(beam):
                     new_hyp = {}
                     new_hyp['score'] = hyp['score'] + local_best_scores[0, j]
-                    new_hyp['yseq'] = torch.ones(1, (1+ys.size(1))).type_as(encoder_outputs).long()
+                    new_hyp['yseq'] = torch.ones(1, (1+ys.size(1))).type_as(audio_encoder_outputs).long()
                     new_hyp['yseq'][:, :ys.size(1)] = hyp['yseq']
                     new_hyp['yseq'][:, ys.size(1)] = int(local_best_ids[0, j])
                     # will be (2 x beam) hyps at most
@@ -199,7 +231,7 @@ class Decoder(nn.Module):
             if i == maxlen - 1:
                 for hyp in hyps:
                     hyp['yseq'] = torch.cat([hyp['yseq'],
-                                             torch.ones(1, 1).fill_(self.eos_id).type_as(encoder_outputs).long()], dim=1)
+                                             torch.ones(1, 1).fill_(self.eos_id).type_as(audio_encoder_outputs).long()], dim=1)
 
             # add ended hypothes to a final list, and removed them from current hypothes
             # (this will be a probmlem, number of hyps < beam)

@@ -6,9 +6,14 @@ tools/kaldi-io-for-python/
 tools/kaldi
 
 egs/*/data
-egs/*/dump
+egs/*/dump*
 egs/*/fbank
 egs/*/exp
+egs/*/dataset
+
+egs/*/decode_pcg
+events.out.tfevents.*
+egs/*/results
 
 # MISC
 .DS_Store

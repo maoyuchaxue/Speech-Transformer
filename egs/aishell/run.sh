@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # -- IMPORTANT
-data=/home/work_nfs/common/data # Modify to your aishell data path
+data=/home/pcg/data # Modify to your aishell data path
 stage=-1  # Modify to control start from witch stage
 # --
 

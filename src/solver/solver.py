@@ -2,10 +2,12 @@ import os
 import time
 
 import torch
+from torch import nn
 
 from loss import cal_performance
 from utils import IGNORE_ID
-
+from IPython import embed
+from tensorboardX import SummaryWriter
 
 class Solver(object):
     """
@@ -18,8 +20,10 @@ class Solver(object):
         self.optimizer = optimizer
 
         # Low frame rate feature
-        self.LFR_m = args.LFR_m
-        self.LFR_n = args.LFR_n
+        self.aud_LFR_m = args.aud_LFR_m
+        self.aud_LFR_n = args.aud_LFR_n
+        self.vid_LFR_m = args.vid_LFR_m
+        self.vid_LFR_n = args.vid_LFR_n
 
         # Training config
         self.epochs = args.epochs
@@ -38,6 +42,9 @@ class Solver(object):
         self.visdom_lr = args.visdom_lr
         self.visdom_epoch = args.visdom_epoch
         self.visdom_id = args.visdom_id
+        self.writer = SummaryWriter(args.save_folder + "/log")
+        print(args.save_folder + "/log")
+        self.global_cnt = 0
         if self.visdom:
             from visdom import Visdom
             self.vis = Visdom(env=self.visdom_id)
@@ -76,18 +83,20 @@ class Solver(object):
             self.model.train()  # Turn on BatchNorm & Dropout
             start = time.time()
             tr_avg_loss = self._run_one_epoch(epoch)
+            # tr_avg_loss = 0
             print('-' * 85)
             print('Train Summary | End of Epoch {0} | Time {1:.2f}s | '
                   'Train Loss {2:.3f}'.format(
                       epoch + 1, time.time() - start, tr_avg_loss))
             print('-' * 85)
+            self.writer.add_scalar('train/epoch_loss', tr_avg_loss, epoch+1)
 
             # Save model each epoch
             if self.checkpoint:
                 file_path = os.path.join(
                     self.save_folder, 'epoch%d.pth.tar' % (epoch + 1))
                 torch.save(self.model.serialize(self.model, self.optimizer, epoch + 1,
-                                                self.LFR_m, self.LFR_n,
+                                                self.aud_LFR_m, self.aud_LFR_n, self.vid_LFR_m, self.vid_LFR_n,
                                                 tr_loss=self.tr_loss,
                                                 cv_loss=self.cv_loss),
                            file_path)
@@ -102,6 +111,7 @@ class Solver(object):
                   'Valid Loss {2:.3f}'.format(
                       epoch + 1, time.time() - start, val_loss))
             print('-' * 85)
+            self.writer.add_scalar('validation/epoch_loss', val_loss, epoch+1)
 
             # Save the best model
             self.tr_loss[epoch] = tr_avg_loss
@@ -110,7 +120,7 @@ class Solver(object):
                 self.best_val_loss = val_loss
                 file_path = os.path.join(self.save_folder, self.model_path)
                 torch.save(self.model.serialize(self.model, self.optimizer, epoch + 1,
-                                                self.LFR_m, self.LFR_n,
+                                                self.aud_LFR_m, self.aud_LFR_n, self.vid_LFR_m, self.vid_LFR_n,
                                                 tr_loss=self.tr_loss,
                                                 cv_loss=self.cv_loss),
                            file_path)
@@ -151,16 +161,32 @@ class Solver(object):
             vis_iters_loss = torch.Tensor(len(data_loader))
 
         for i, (data) in enumerate(data_loader):
-            padded_input, input_lengths, padded_target = data
-            padded_input = padded_input.cuda()
-            input_lengths = input_lengths.cuda()
-            padded_target = padded_target.cuda()
-            pred, gold = self.model(padded_input, input_lengths, padded_target)
-            loss, n_correct = cal_performance(pred, gold,
-                                              smoothing=self.label_smoothing)
+            if data == None:
+                print("invalid data")
+                continue
+            try:
+                padded_audio_input, audio_input_lengths, padded_visual_input, visual_input_lengths, padded_target = data
+                padded_audio_input = padded_audio_input.cuda()
+                audio_input_lengths = audio_input_lengths.cuda()
+                padded_visual_input = padded_visual_input.cuda()
+                visual_input_lengths = visual_input_lengths.cuda()
+                padded_target = padded_target.cuda()
+                pred, gold = self.model(padded_audio_input, audio_input_lengths, padded_visual_input, visual_input_lengths, padded_target)
+                loss, n_correct = cal_performance(pred, gold,
+                                                    smoothing=self.label_smoothing)
+            except:
+                print("out of memory")
+                continue
+            
+            '''
+            except:
+                print("@"*70)
+                continue
+            '''
             if not cross_valid:
                 self.optimizer.zero_grad()
                 loss.backward()
+                nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=5.)
                 self.optimizer.step()
 
             total_loss += loss.item()
@@ -168,12 +194,14 @@ class Solver(object):
             n_word = non_pad_mask.sum().item()
 
             if i % self.print_freq == 0:
+                #print(loss.item(), self.global_cnt)
+                self.writer.add_scalar('train/loss',loss.item(), self.global_cnt)    
+                self.global_cnt += 1
                 print('Epoch {0} | Iter {1} | Average Loss {2:.3f} | '
                       'Current Loss {3:.6f} | {4:.1f} ms/batch'.format(
                           epoch + 1, i + 1, total_loss / (i + 1),
                           loss.item(), 1000 * (time.time() - start) / (i + 1)),
                       flush=True)
-
             # visualizing loss using visdom
             if self.visdom_epoch and not cross_valid:
                 vis_iters_loss[i] = loss.item()

@@ -23,8 +23,14 @@ class TransformerOptimizer(object):
 
     def _update_lr(self):
         self.step_num += 1
-        lr = self.k * self.init_lr * min(self.step_num ** (-0.5),
-                                         self.step_num * (self.warmup_steps ** (-1.5)))
+        '''
+        if (self.step_num < self.warmup_steps):
+            lr = self.k * self.init_lr * 0.01 * (self.step_num / self.warmup_steps)
+        else:
+            lr = self.k * self.init_lr * 0.01
+        '''
+        lr = self.k * self.init_lr * min((self.step_num + 1) ** (-0.5),
+                                         (self.step_num + 1) * (self.warmup_steps ** (-1.5)))
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
 

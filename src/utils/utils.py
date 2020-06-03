@@ -91,7 +91,7 @@ def add_results_to_json(js, nbest_hyps, char_list):
             print('groundtruth: %s' % out_dic['text'])
             print('prediction : %s' % out_dic['rec_text'])
 
-    return new_js
+    return new_js, out_dic['text'], out_dic['rec_text']
 
 
 # -- Transformer Related --
@@ -120,6 +120,7 @@ def get_subsequent_mask(seq):
     sz_b, len_s = seq.size()
     subsequent_mask = torch.triu(
         torch.ones((len_s, len_s), device=seq.device, dtype=torch.uint8), diagonal=1)
+    #subsequent_mask = subsequent_mask.bool()
     subsequent_mask = subsequent_mask.unsqueeze(0).expand(sz_b, -1, -1)  # b x ls x ls
 
     return subsequent_mask

@@ -4,6 +4,10 @@
 # Copyright 2017 Johns Hopkins University (Shinji Watanabe)
 #  Apache 2.0  (http://www.apache.org/licenses/LICENSE-2.0)
 
+import sys
+import codecs
+sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
+
 import json
 import argparse
 import logging
@@ -36,8 +40,8 @@ if __name__ == '__main__':
 
     logging.info("writing hyp trn to %s", args.hyp)
     logging.info("writing ref trn to %s", args.ref)
-    h = open(args.hyp, 'w')
-    r = open(args.ref, 'w')
+    h = open(args.hyp, 'w', encoding="utf-8")
+    r = open(args.ref, 'w', encoding="utf-8")
 
     for x in j['utts']:
         seq = [char_list[int(i)] for i in j['utts'][x]
